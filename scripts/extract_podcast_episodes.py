@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Extract podcast episode URLs from Apple Podcasts and save as .md file.
-For Apple Podcasts URLs: outputs Apple Podcasts episode page URLs via iTunes API.
+For Apple Podcasts URLs: uses RSS feed for full episode list + iTunes API for
+Apple Podcasts page URLs (hybrid approach, no 200 episode limit on filtering).
 For RSS feed URLs: outputs audio URLs from enclosures.
 Supports keyword filtering, episode limiting, and direct RSS feed URLs.
 Zero external dependencies — uses only Python stdlib.
@@ -43,17 +44,17 @@ def is_rss_url(url):
     return "podcasts.apple.com" not in parsed.netloc
 
 
-def get_episodes_from_itunes(podcast_id):
-    """Get episodes with Apple Podcasts URLs from iTunes Lookup API.
+def get_itunes_url_map(podcast_id):
+    """Build title → Apple Podcasts URL mapping from iTunes Lookup API.
 
-    Returns up to 200 most recent episodes with their Apple Podcasts page URLs.
+    Returns (podcast_name, {normalized_title: apple_podcasts_url}).
     """
     url = f"{ITUNES_LOOKUP_BASE}?id={podcast_id}&entity=podcastEpisode&limit=200"
     data = json.loads(fetch_url(url, timeout=60))
     results = data.get("results", [])
 
     podcast_name = None
-    episodes = []
+    url_map = {}
 
     for result in results:
         wrapper_type = result.get("wrapperType", "")
@@ -65,24 +66,12 @@ def get_episodes_from_itunes(podcast_id):
             continue
 
         if wrapper_type == "podcastEpisode":
-            episode = {
-                "title": result.get("trackName", "Untitled"),
-                "description": result.get("description", ""),
-                "pub_date": result.get("releaseDate", ""),
-                "duration": "",
-                "url": result.get("trackViewUrl", ""),
-            }
-            # Format duration from milliseconds
-            millis = result.get("trackTimeMillis", 0)
-            if millis:
-                secs = millis // 1000
-                mins = secs // 60
-                episode["duration"] = f"{mins}:{secs % 60:02d}"
+            title = result.get("trackName", "")
+            apple_url = result.get("trackViewUrl", "")
+            if title and apple_url:
+                url_map[title.strip()] = apple_url
 
-            if episode["url"]:
-                episodes.append(episode)
-
-    return podcast_name, episodes
+    return podcast_name, url_map
 
 
 def get_rss_feed_url(podcast_id):
@@ -216,7 +205,10 @@ def main():
         print(f"Total episodes: {len(episodes)}")
         print("Mode: audio URLs from RSS feed")
     else:
-        # Apple Podcasts URL: use iTunes API for Apple Podcasts episode URLs
+        # Apple Podcasts URL: hybrid approach
+        # 1. Get RSS feed for complete episode list (unlimited)
+        # 2. Get iTunes API data for Apple Podcasts URL mapping (up to 200)
+        # 3. Filter from RSS, map to Apple Podcasts URLs
         podcast_id = extract_podcast_id(args.podcast_url)
         if not podcast_id:
             print("Error: Could not extract podcast ID from URL.")
@@ -224,16 +216,53 @@ def main():
             sys.exit(1)
 
         print(f"Looking up podcast ID: {podcast_id}")
+
+        # Step 1: Get RSS feed URL and fetch all episodes
         try:
-            podcast_name, episodes = get_episodes_from_itunes(podcast_id)
+            feed_url, itunes_name = get_rss_feed_url(podcast_id)
         except (HTTPError, URLError) as e:
-            print(f"Error fetching from iTunes API: {e}")
+            print(f"Error looking up podcast: {e}")
             sys.exit(1)
 
+        if not feed_url:
+            print("Error: Could not find RSS feed for this podcast.")
+            sys.exit(1)
+
+        print(f"Fetching RSS feed: {feed_url}")
+        try:
+            feed_xml = fetch_url(feed_url, timeout=60)
+        except (HTTPError, URLError) as e:
+            print(f"Error fetching RSS feed: {e}")
+            sys.exit(1)
+
+        podcast_name, episodes = parse_rss_feed(feed_xml)
         if not podcast_name:
-            podcast_name = "podcast"
+            podcast_name = itunes_name or "podcast"
         print(f"Podcast: {podcast_name}")
-        print(f"Episodes from iTunes API: {len(episodes)} (max 200)")
+        print(f"Total episodes from RSS: {len(episodes)}")
+
+        # Step 2: Get Apple Podcasts URL mapping from iTunes API
+        print("Fetching Apple Podcasts URLs from iTunes API...")
+        try:
+            _, url_map = get_itunes_url_map(podcast_id)
+        except (HTTPError, URLError) as e:
+            print(f"Warning: Could not fetch iTunes data: {e}")
+            url_map = {}
+
+        print(f"Apple Podcasts URLs available: {len(url_map)} (iTunes API max 200)")
+
+        # Step 3: Replace audio URLs with Apple Podcasts URLs where possible
+        mapped = 0
+        unmapped = 0
+        for ep in episodes:
+            apple_url = url_map.get(ep["title"])
+            if apple_url:
+                ep["url"] = apple_url
+                mapped += 1
+            else:
+                unmapped += 1
+
+        print(f"URL mapping: {mapped} mapped, {unmapped} unmapped (older episodes)")
         print("Mode: Apple Podcasts episode URLs")
 
     # Filter by keywords
@@ -247,6 +276,14 @@ def main():
         print("No matching episodes found.")
         sys.exit(0)
 
+    # For Apple Podcasts mode: separate mapped vs unmapped after filtering
+    if not is_rss_url(args.podcast_url):
+        apple_eps = [ep for ep in episodes if "podcasts.apple.com" in ep["url"]]
+        other_eps = [ep for ep in episodes if "podcasts.apple.com" not in ep["url"]]
+        if other_eps:
+            print(f"  - {len(apple_eps)} with Apple Podcasts URLs")
+            print(f"  - {len(other_eps)} older episodes (audio URLs, no Apple Podcasts URL available)")
+
     # Limit count
     if args.max_episodes and len(episodes) > args.max_episodes:
         episodes = episodes[:args.max_episodes]
@@ -259,9 +296,10 @@ def main():
         print(f"{'='*60}")
         for i, ep in enumerate(episodes, 1):
             dur_str = ep["duration"] if ep["duration"] else "unknown duration"
+            url_type = "Apple Podcasts" if "podcasts.apple.com" in ep["url"] else "audio"
             print(f"\n{i}. {ep['title']}")
             print(f"   Date: {ep['pub_date']}")
-            print(f"   Duration: {dur_str}")
+            print(f"   Duration: {dur_str} | URL type: {url_type}")
         sys.exit(0)
 
     # Save URLs to .md file
